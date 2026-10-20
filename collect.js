@@ -329,6 +329,47 @@ function createKisCaller(appKey, appSecret, initialToken) {
   };
 }
 
+// ------------------------------------------------------------
+// 순위분석 API 시장 구분 후보 (2026-10-20 추가)
+// - 후보를 차례로 시도해 "데이터가 실제로 나온" 방법을 찾고, out/ranking-variant.json에 기억해 다음 실행부터 바로 사용
+// - 응답이 비어 있으면 KIS가 준 메시지(rt_cd/msg_cd/msg1)를 로그로 남겨 원인 확인 가능하게 함
+// ------------------------------------------------------------
+const RANKING_VARIANTS = [
+  { id: 'J-0001', kospi: { FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: '0001' }, kosdaq: { FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: '1001' } },
+  { id: 'UN-0001', kospi: { FID_COND_MRKT_DIV_CODE: 'UN', FID_INPUT_ISCD: '0001' }, kosdaq: { FID_COND_MRKT_DIV_CODE: 'UN', FID_INPUT_ISCD: '1001' } },
+  { id: 'KSP', kospi: { FID_COND_MRKT_DIV_CODE: 'KSP', FID_INPUT_ISCD: '0000' }, kosdaq: { FID_COND_MRKT_DIV_CODE: 'KSQ', FID_INPUT_ISCD: '0000' } },
+];
+const VARIANT_FILE = () => path.join(OUT_DIR, 'ranking-variant.json');
+function loadVariantMemo() { try { return JSON.parse(fs.readFileSync(VARIANT_FILE(), 'utf8')); } catch { return {}; } }
+const variantMemo = loadVariantMemo();
+async function fetchRankingByMarket(call, kind, apiPath, trId, baseParams, market, pickRows) {
+  const ordered = [...RANKING_VARIANTS].sort((a, b) => (a.id === variantMemo[kind] ? -1 : 0) - (b.id === variantMemo[kind] ? -1 : 0));
+  let last = null;
+  for (const v of ordered) {
+    const res = await call(apiPath, trId, { ...baseParams, ...v[market] });
+    const rows = pickRows(res);
+    if (Array.isArray(rows) && rows.length > 0) {
+      if (variantMemo[kind] !== v.id) {
+        variantMemo[kind] = v.id;
+        writeJson('ranking-variant.json', variantMemo);
+        console.log(`[개미데이터] ${kind} ${market}: 시장 구분 방식 '${v.id}'로 데이터 확인`);
+      }
+      return res;
+    }
+    console.warn(`[개미데이터] ${kind} ${market} '${v.id}' 응답 비어 있음 → rt_cd=${res?.rt_cd} msg_cd=${res?.msg_cd} msg=${res?.msg1}`);
+    last = res;
+  }
+  // 최후 수단: 시장 구분 없이 전체(UN, 0000) 한 번 — 예전(2026-09 이전)에 실제로 동작하던 방식.
+  // 코스피 자리에만 넣어 "전체" 순위라도 채움 (이 경우 코스피/코스닥 탭 구분은 정확하지 않을 수 있음)
+  if (market === 'kospi') {
+    const res = await call(apiPath, trId, { ...baseParams, FID_COND_MRKT_DIV_CODE: 'UN', FID_INPUT_ISCD: '0000' });
+    const rows = pickRows(res);
+    console.warn(`[개미데이터] ${kind}: 시장 분리 조회 모두 실패 → 전체(UN) 조회 ${Array.isArray(rows) ? rows.length : 0}건으로 대체 (msg=${res?.msg1})`);
+    if (Array.isArray(rows) && rows.length > 0) return res;
+  }
+  return last;
+}
+
 function ymdToDate(ymd) { // 'YYYYMMDD' -> Date
   return new Date(`${ymd.slice(0,4)}-${ymd.slice(4,6)}-${ymd.slice(6,8)}T00:00:00+09:00`);
 }
@@ -396,31 +437,19 @@ async function fetchAntDataSnapshot(appKey, appSecret, initialToken) {
     FID_INPUT_ISCD: 'KSQ', FID_INPUT_ISCD_2: '1001',
   });
 
-  // 공매도 상위 - 코스피/코스닥 분리 조회 (2026-09 변경)
-  // ⚠️ 통합(UN) 호출은 최대 30건이라 코스피·코스닥이 섞여서 한쪽이 밀려날 수 있었음.
-  //    KSP(코스피)/KSQ(코스닥)로 나눠 호출하면 각각 최대 30건씩, 총 60건까지 확보 가능.
-  //    ⚠️ 이 시장구분 값(KSP/KSQ)이 이 API에서 실제로 먹히는지는 배포 후 응답을 직접 확인해서 검증 필요.
-  //    안 먹히면(예: 응답이 비거나 에러) 즉시 FID_COND_MRKT_DIV_CODE: 'UN' 통합 방식으로 롤백할 것.
-  const shortSaleTopKospi = await call('/uapi/domestic-stock/v1/ranking/short-sale', 'FHPST04820000', {
-    FID_APLY_RANG_VOL: '', FID_COND_MRKT_DIV_CODE: 'KSP', FID_COND_SCR_DIV_CODE: '20482',
-    FID_INPUT_ISCD: '0000', FID_PERIOD_DIV_CODE: 'D', FID_INPUT_CNT_1: '0',
+  // 공매도·신용잔고 상위 - 코스피/코스닥 분리 조회
+  // ⚠️ 2026-10-20 GitHub 이전 때 확인: 기존 KSP/KSQ 방식은 응답이 비어 있었음(원본 주석의 "검증 필요" 항목).
+  //    그래서 시장 구분 방법 후보를 순서대로 시도하고, 처음으로 데이터가 나온 방법을 기억해서 다음부터 그걸 먼저 씀.
+  //    (KIS 순위분석 API의 표준 방식: FID_INPUT_ISCD 0001=코스피, 1001=코스닥)
+  const shortBase = {
+    FID_APLY_RANG_VOL: '', FID_COND_SCR_DIV_CODE: '20482', FID_PERIOD_DIV_CODE: 'D', FID_INPUT_CNT_1: '0',
     FID_TRGT_EXLS_CLS_CODE: '', FID_TRGT_CLS_CODE: '', FID_APLY_RANG_PRC_1: '', FID_APLY_RANG_PRC_2: '',
-  });
-  const shortSaleTopKosdaq = await call('/uapi/domestic-stock/v1/ranking/short-sale', 'FHPST04820000', {
-    FID_APLY_RANG_VOL: '', FID_COND_MRKT_DIV_CODE: 'KSQ', FID_COND_SCR_DIV_CODE: '20482',
-    FID_INPUT_ISCD: '0000', FID_PERIOD_DIV_CODE: 'D', FID_INPUT_CNT_1: '0',
-    FID_TRGT_EXLS_CLS_CODE: '', FID_TRGT_CLS_CODE: '', FID_APLY_RANG_PRC_1: '', FID_APLY_RANG_PRC_2: '',
-  });
-
-  // 신용잔고 상위 - 코스피/코스닥 분리 조회 (2026-09 변경, 사유는 위 공매도 주석과 동일)
-  const creditBalanceTopKospi = await call('/uapi/domestic-stock/v1/ranking/credit-balance', 'FHKST17010000', {
-    FID_COND_SCR_DIV_CODE: '11701', FID_INPUT_ISCD: '0000', FID_OPTION: '2',
-    FID_COND_MRKT_DIV_CODE: 'KSP', FID_RANK_SORT_CLS_CODE: '2',
-  });
-  const creditBalanceTopKosdaq = await call('/uapi/domestic-stock/v1/ranking/credit-balance', 'FHKST17010000', {
-    FID_COND_SCR_DIV_CODE: '11701', FID_INPUT_ISCD: '0000', FID_OPTION: '2',
-    FID_COND_MRKT_DIV_CODE: 'KSQ', FID_RANK_SORT_CLS_CODE: '2',
-  });
+  };
+  const creditBase = { FID_COND_SCR_DIV_CODE: '11701', FID_OPTION: '2', FID_RANK_SORT_CLS_CODE: '2' };
+  const shortSaleTopKospi = await fetchRankingByMarket(call, 'short', '/uapi/domestic-stock/v1/ranking/short-sale', 'FHPST04820000', shortBase, 'kospi', (r) => r?.output);
+  const shortSaleTopKosdaq = await fetchRankingByMarket(call, 'short', '/uapi/domestic-stock/v1/ranking/short-sale', 'FHPST04820000', shortBase, 'kosdaq', (r) => r?.output);
+  const creditBalanceTopKospi = await fetchRankingByMarket(call, 'credit', '/uapi/domestic-stock/v1/ranking/credit-balance', 'FHKST17010000', creditBase, 'kospi', (r) => r?.output2);
+  const creditBalanceTopKosdaq = await fetchRankingByMarket(call, 'credit', '/uapi/domestic-stock/v1/ranking/credit-balance', 'FHKST17010000', creditBase, 'kosdaq', (r) => r?.output2);
 
   // 신용잔고 TOP 종목들의 실시간 현재가·시가총액 별도 조회 (2026-08 추가)
   // — "신용잔고비율(주식수 기준)"과는 별개로, "시총 대비 신용잔고금액" 비율을 함께 보여주기 위함.
