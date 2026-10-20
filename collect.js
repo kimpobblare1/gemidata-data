@@ -453,6 +453,10 @@ async function fetchAntDataSnapshot(appKey, appSecret, initialToken) {
   const shortSaleTopKosdaq = await fetchRankingByMarket(call, 'short', '/uapi/domestic-stock/v1/ranking/short-sale', 'FHPST04820000', shortBase, 'kosdaq', (r) => r?.output);
   const creditBalanceTopKospi = await fetchRankingByMarket(call, 'credit', '/uapi/domestic-stock/v1/ranking/credit-balance', 'FHKST17010000', creditBase, 'kospi', (r) => r?.output2);
   const creditBalanceTopKosdaq = await fetchRankingByMarket(call, 'credit', '/uapi/domestic-stock/v1/ranking/credit-balance', 'FHKST17010000', creditBase, 'kosdaq', (r) => r?.output2);
+  // "전체" 탭(홈 화면 기본·블로그 캡처용)은 예전 Cloud Run과 똑같이 시장 전체(UN, 0000) 한 번 조회 결과를 씀.
+  // (예전 KSP/KSQ 호출은 실제로 시장 구분이 안 먹혀 전체 목록이 왔었고, 그 목록이 지금까지 사이트·블로그 수치의 기준이었음)
+  const shortSaleTopAll = await call('/uapi/domestic-stock/v1/ranking/short-sale', 'FHPST04820000', { ...shortBase, FID_COND_MRKT_DIV_CODE: 'UN', FID_INPUT_ISCD: '0000' });
+  const creditBalanceTopAll = await call('/uapi/domestic-stock/v1/ranking/credit-balance', 'FHKST17010000', { ...creditBase, FID_COND_MRKT_DIV_CODE: 'UN', FID_INPUT_ISCD: '0000' });
 
   // 신용잔고 TOP 종목들의 실시간 현재가·시가총액 별도 조회 (2026-08 추가)
   // — "신용잔고비율(주식수 기준)"과는 별개로, "시총 대비 신용잔고금액" 비율을 함께 보여주기 위함.
@@ -460,7 +464,8 @@ async function fetchAntDataSnapshot(appKey, appSecret, initialToken) {
   const creditCodes = [
     ...dedupeByCode(creditBalanceTopKospi?.output2 ?? []).filter(isRegularStock).map((r) => r.mksc_shrn_iscd),
     ...dedupeByCode(creditBalanceTopKosdaq?.output2 ?? []).filter(isRegularStock).map((r) => r.mksc_shrn_iscd),
-  ];
+    ...dedupeByCode(creditBalanceTopAll?.output2 ?? []).filter(isRegularStock).map((r) => r.mksc_shrn_iscd),
+  ].filter((c, i, arr) => arr.indexOf(c) === i);
   const creditPriceOverrideMap = await fetchCreditMarketCaps(creditCodes, call);
 
   // 국내 증시자금 종합 - 시장 전체 신용융자잔고/고객예탁금/미수금 (종목 단위 아님, 시장 전체 합계)
@@ -529,7 +534,7 @@ async function fetchAntDataSnapshot(appKey, appSecret, initialToken) {
 
   return {
     kospi, kosdaq, kospiFlow, kosdaqFlow,
-    shortSaleTopKospi, shortSaleTopKosdaq, creditBalanceTopKospi, creditBalanceTopKosdaq,
+    shortSaleTopKospi, shortSaleTopKosdaq, creditBalanceTopKospi, creditBalanceTopKosdaq, shortSaleTopAll, creditBalanceTopAll,
     marketFunds, conditionResults,
     foreignBuyTotal, foreignSellTotal, instBuyTotal, instSellTotal, priceOverrideMap, creditPriceOverrideMap,
   };
@@ -679,10 +684,10 @@ function normalizeAntData(raw) {
     // 기존 프론트엔드 호환을 위해 shortSaleTop/creditBalanceTop은 코스피+코스닥을 합쳐 재정렬한
     // "통합 TOP30"을 그대로 유지하고, 시장별로 나눠 보고 싶을 때 쓸 수 있게
     // shortSaleTopByMarket / creditBalanceTopByMarket을 새로 추가함 (각 시장 TOP30, 최대 60건).
-    shortSaleTop: [
+    shortSaleTop: ((raw.shortSaleTopAll?.output?.length) ? [...raw.shortSaleTopAll.output] : [
       ...(raw.shortSaleTopKospi?.output ?? []),
       ...(raw.shortSaleTopKosdaq?.output ?? []),
-    ]
+    ])
       .filter(isRegularStock)
       .sort((a, b) => Number(b.ssts_vol_rlim) - Number(a.ssts_vol_rlim)) // 공매도 비중 기준 직접 정렬 (API 자체 순서를 신뢰하지 않음)
       .slice(0, 30).map(mapShortSaleRow),
@@ -696,7 +701,7 @@ function normalizeAntData(raw) {
         .sort((a, b) => Number(b.ssts_vol_rlim) - Number(a.ssts_vol_rlim))
         .slice(0, 30).map(mapShortSaleRow),
     },
-    creditBalanceTop: dedupeByCode([
+    creditBalanceTop: dedupeByCode((raw.creditBalanceTopAll?.output2?.length) ? [...raw.creditBalanceTopAll.output2] : [
       ...(raw.creditBalanceTopKospi?.output2 ?? []),
       ...(raw.creditBalanceTopKosdaq?.output2 ?? []),
     ]) // API가 종목을 중복으로 주는 경우가 있어 중복 제거 필수
