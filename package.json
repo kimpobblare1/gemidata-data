@@ -1,0 +1,8 @@
+{
+  "name": "gemidata-data",
+  "private": true,
+  "description": "개미데이터 KIS 데이터 수집기 (GitHub Actions)",
+  "engines": { "node": ">=20" },
+  "scripts": { "collect": "node collect.js", "collect:credit": "node collect.js --credit" },
+  "dependencies": { "axios": "^1.7.2" }
+}
