@@ -1,0 +1,88 @@
+# 개미데이터 데이터 수집 (Cloud Run + Cloud Scheduler 대체)
+# - 평일 08:00~20:00(한국시간, 넥스트레이드 프리·애프터마켓 포함) 5분마다 KIS 데이터를 받아 data 브랜치에 JSON으로 올려요.
+# - 18시 이후 첫 실행 때 신용잔고 5년 추이(credit-trend.json)도 하루 한 번 갱신해요.
+# ⚠️ GitHub 예약 실행 시간은 UTC 기준이라 한국시간 -9시간으로 적었어요.
+#    (한국 월~금 08시 = UTC 일~목 23시라서 첫 줄만 요일이 0-4예요)
+# ⚠️ GitHub가 바쁠 때는 예약 실행이 몇 분 늦어질 수 있어요(정상).
+name: collect
+
+on:
+  schedule:
+    - cron: '*/5 23 * * 0-4'    # 한국시간 평일 08:00~08:55
+    - cron: '*/5 0-10 * * 1-5'  # 한국시간 평일 09:00~19:55
+    - cron: '0 11 * * 1-5'      # 한국시간 평일 20:00 (넥스트레이드 마감)
+  workflow_dispatch:            # Actions 탭에서 "Run workflow" 버튼으로 수동 실행
+    inputs:
+      credit:
+        description: '신용잔고 5년 추이도 같이 갱신할까요? (true/false)'
+        default: 'false'
+
+permissions:
+  contents: write               # data 브랜치에 JSON을 올리기 위해 필요
+
+concurrency:
+  group: collect
+  cancel-in-progress: false     # 이전 실행이 아직 돌고 있으면 끝날 때까지 기다림
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: 코드 가져오기
+        uses: actions/checkout@v4
+
+      - name: Node.js 준비
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: 라이브러리 설치
+        run: npm install --no-audit --no-fund
+
+      - name: 이전 데이터(data 브랜치) 가져오기
+        run: |
+          git fetch origin data --depth=1 || echo "data 브랜치가 아직 없어요 (첫 실행)"
+          mkdir -p out
+          if git rev-parse --verify origin/data >/dev/null 2>&1; then
+            git --work-tree=out checkout origin/data -- .
+          fi
+
+      - name: 접근토큰 캐시 불러오기 (암호화된 파일)
+        uses: actions/cache@v4
+        with:
+          path: .cache
+          key: kis-token-${{ github.run_id }}
+          restore-keys: kis-token-
+
+      - name: 수집 모드 정하기 (신용잔고 추이는 18시 이후 하루 1번만)
+        id: mode
+        run: |
+          HOUR=$(TZ=Asia/Seoul date +%-H)
+          TODAY=$(TZ=Asia/Seoul date +%Y%m%d)
+          LAST=$(node -e "try{const d=require('./out/credit-trend.json').data;console.log(new Date(d.updatedAt+9*3600e3).toISOString().slice(0,10).replace(/-/g,''))}catch(e){console.log('none')}")
+          if [ "${{ github.event.inputs.credit }}" = "true" ] || [ "$LAST" = "none" ] || { [ "$HOUR" -ge 18 ] && [ "$LAST" != "$TODAY" ]; }; then
+            echo "args=--credit" >> "$GITHUB_OUTPUT"; echo "신용잔고 추이도 갱신해요"
+          else
+            echo "args=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: KIS 데이터 수집
+        env:
+          KIS_APP_KEY: ${{ secrets.KIS_APP_KEY }}
+          KIS_APP_SECRET: ${{ secrets.KIS_APP_SECRET }}
+          KIS_HTS_ID: ${{ secrets.KIS_HTS_ID }}
+          OUT_DIR: out
+          CACHE_DIR: .cache
+        run: node collect.js ${{ steps.mode.outputs.args }}
+
+      - name: data 브랜치에 올리기 (기록은 항상 1개만 유지)
+        run: |
+          cd out
+          git init -q
+          git checkout -q -b data
+          git config user.name "gemidata-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "data $(TZ=Asia/Seoul date '+%Y-%m-%d %H:%M') KST"
+          git push -q -f "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" data
