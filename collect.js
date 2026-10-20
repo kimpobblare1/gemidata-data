@@ -334,23 +334,26 @@ function createKisCaller(appKey, appSecret, initialToken) {
 // - 후보를 차례로 시도해 "데이터가 실제로 나온" 방법을 찾고, out/ranking-variant.json에 기억해 다음 실행부터 바로 사용
 // - 응답이 비어 있으면 KIS가 준 메시지(rt_cd/msg_cd/msg1)를 로그로 남겨 원인 확인 가능하게 함
 // ------------------------------------------------------------
+// ⚠️ 순서가 중요: UN(KRX+넥스트레이드 통합)을 먼저 — 기존 사이트·블로그 수치가 통합 기준이라서.
+//    J(KRX 단독)는 넥스트레이드 거래량이 빠져 공매도 비중이 더 높게 나옴(2026-10-20 확인: 에코프로비엠 24.05% vs 35.67%).
 const RANKING_VARIANTS = [
-  { id: 'J-0001', kospi: { FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: '0001' }, kosdaq: { FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: '1001' } },
   { id: 'UN-0001', kospi: { FID_COND_MRKT_DIV_CODE: 'UN', FID_INPUT_ISCD: '0001' }, kosdaq: { FID_COND_MRKT_DIV_CODE: 'UN', FID_INPUT_ISCD: '1001' } },
+  { id: 'J-0001', kospi: { FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: '0001' }, kosdaq: { FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: '1001' } },
   { id: 'KSP', kospi: { FID_COND_MRKT_DIV_CODE: 'KSP', FID_INPUT_ISCD: '0000' }, kosdaq: { FID_COND_MRKT_DIV_CODE: 'KSQ', FID_INPUT_ISCD: '0000' } },
 ];
 const VARIANT_FILE = () => path.join(OUT_DIR, 'ranking-variant.json');
 function loadVariantMemo() { try { return JSON.parse(fs.readFileSync(VARIANT_FILE(), 'utf8')); } catch { return {}; } }
 const variantMemo = loadVariantMemo();
 async function fetchRankingByMarket(call, kind, apiPath, trId, baseParams, market, pickRows) {
-  const ordered = [...RANKING_VARIANTS].sort((a, b) => (a.id === variantMemo[kind] ? -1 : 0) - (b.id === variantMemo[kind] ? -1 : 0));
+  const memoKey = kind + '_v2'; // v2: UN 우선 순서로 바꾸면서 예전 기억(J-0001)은 무시
+  const ordered = [...RANKING_VARIANTS].sort((a, b) => (a.id === variantMemo[memoKey] ? -1 : 0) - (b.id === variantMemo[memoKey] ? -1 : 0));
   let last = null;
   for (const v of ordered) {
     const res = await call(apiPath, trId, { ...baseParams, ...v[market] });
     const rows = pickRows(res);
     if (Array.isArray(rows) && rows.length > 0) {
-      if (variantMemo[kind] !== v.id) {
-        variantMemo[kind] = v.id;
+      if (variantMemo[memoKey] !== v.id) {
+        variantMemo[memoKey] = v.id;
         writeJson('ranking-variant.json', variantMemo);
         console.log(`[개미데이터] ${kind} ${market}: 시장 구분 방식 '${v.id}'로 데이터 확인`);
       }
